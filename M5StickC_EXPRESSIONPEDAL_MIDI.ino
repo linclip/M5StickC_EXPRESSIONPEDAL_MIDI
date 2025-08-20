@@ -6,7 +6,7 @@ Libraries:
   M5Unified v0.2.5
   NimBLE-Arduino v1.4.3
   BLE-MIDI by lathoub v2.2
-  MIDI Library by lathoub v5.0.2
+  MIDI Library by Francois Best, lathoub v5.0.2
 */
 
 #include <M5Unified.h>
@@ -28,6 +28,9 @@ const int ANALOG_PIN = 36;  // G36ピン or G26ピン  (HAT側)
 const uint8_t MIDI_CHANNEL = 1;
 const uint8_t CC_NUMBER = 1;    // モジュレーションホイール
 
+// 液晶設定
+const int LCD_BRIGHTNESS = 64;  // 0-255の範囲（デフォルト128の半分で節電）
+
 // アナログ値のフィルタリング用
 int lastValue = 0;
 const int THRESHOLD = 5;  // ノイズ除去のための閾値
@@ -37,6 +40,32 @@ bool isConnected = false;
 bool displayNeedsUpdate = true;  // 画面更新フラグ
 unsigned long lastConnectionCheck = 0;
 const unsigned long CONNECTION_CHECK_INTERVAL = 1000; // 1秒ごとにチェック
+
+// バッテリー監視用
+unsigned long lastBatteryCheck = 0;
+const unsigned long BATTERY_CHECK_INTERVAL = 60000; // 1分ごとにチェック
+int batteryPercent = 100;
+bool batteryInitialized = false; // 起動時の初期化フラグ
+
+// 非同期バッテリー測定用
+float batteryVoltageSum = 0;
+int batteryMeasurementCount = 0;
+const int BATTERY_SAMPLES = 3;  // 測定回数を3回に削減
+unsigned long lastBatteryMeasurement = 0;
+const unsigned long BATTERY_MEASUREMENT_INTERVAL = 100; // 100msごとに1回測定
+float currentBatteryVoltage = 0;  // 現在の電圧値（表示用）
+int m5BatteryLevel = 0;  // M5.Power.getBatteryLevel()の値（表示用）
+
+// 画面レイアウト定数
+const int SCREEN_WIDTH = 160;
+const int SCREEN_HEIGHT = 80;
+const int LINE_HEIGHT = 12;
+
+// 関数プロトタイプ宣言
+void drawBattery();
+void drawConnectionStatus();
+void updateMainDisplay();
+int getBatteryPercent();
 
 // ペダル校正クラス
 class PedalCalibrator {
@@ -60,14 +89,18 @@ public:
     void startCalibration() {
         calibrationMode = true;
         calibrationStart = millis();
-        minVal = 4095;  // リセット
-        maxVal = 0;
+        // 現在の値で初期化（最初の読み取り値から開始）
+        int currentValue = analogRead(ANALOG_PIN);
+        minVal = currentValue;
+        maxVal = currentValue;
         Serial.println("Calibration started - move pedal fully for 5 seconds!");
+        Serial.printf("Starting with current value: %d\n", currentValue);
         
         // 画面表示
         M5.Display.clear();
-        M5.Display.drawString("Calibration Mode", 10, 10);
-        M5.Display.drawString("Move pedal fully!", 10, 30);
+        drawBattery(); // バッテリー表示は維持
+        M5.Display.drawString("Calibration Mode", 5, 10);
+        M5.Display.drawString("Move pedal fully!", 5, 25);
     }
     
     bool updateCalibration(int rawValue) {
@@ -80,10 +113,12 @@ public:
         // 進捗表示
         unsigned long elapsed = millis() - calibrationStart;
         int progress = (elapsed * 100) / CALIBRATION_TIME;
-        M5.Display.fillRect(0, 50, 160, 40, BLACK);
-        M5.Display.drawString("Progress: " + String(progress) + "%", 10, 50);
-        M5.Display.drawString("Min:" + String(minVal), 10, 65);
-        M5.Display.drawString("Max:" + String(maxVal), 10, 80);
+        
+        // 進捗エリアをクリア（バッテリー表示は保持）
+        M5.Display.fillRect(0, 40, SCREEN_WIDTH-30, 40, BLACK);
+        M5.Display.drawString("Progress: " + String(progress) + "%", 5, 40);
+        M5.Display.drawString("Min:" + String(minVal), 5, 52);
+        M5.Display.drawString("Max:" + String(maxVal), 5, 64);
         
         // 校正完了チェック
         if (elapsed >= CALIBRATION_TIME) {
@@ -104,15 +139,14 @@ public:
         
         // 画面表示
         M5.Display.clear();
-        M5.Display.drawString("Calibration Done!", 10, 10);
-        M5.Display.drawString("Min: " + String(minVal), 10, 30);
-        M5.Display.drawString("Max: " + String(maxVal), 10, 50);
+        drawBattery();
+        M5.Display.drawString("Calibration Done!", 5, 10);
+        M5.Display.drawString("Min: " + String(minVal), 5, 25);
+        M5.Display.drawString("Max: " + String(maxVal), 5, 40);
         delay(2000);  // 2秒間表示
         
         // 通常画面に戻す
-        M5.Display.clear();
-        M5.Display.drawString("M5EXP-MIDI (NimBLE)", 5, 10);
-        M5.Display.drawString(isConnected ? "Connected!" : "Disconnected", 10, 30);
+        updateMainDisplay();
         displayNeedsUpdate = true;  // 校正後は画面更新フラグをリセット
     }
     
@@ -130,6 +164,156 @@ public:
 // グローバルインスタンス
 PedalCalibrator calibrator;
 
+// バッテリー残量を計算（電圧値から）
+int calculateBatteryPercent(float voltage) {
+    // より実用的な電圧範囲: 3.3V(0%) - 4.1V(100%) - mV単位
+    const float MIN_VOLTAGE = 3300;  // mV単位 - シャットダウン間近
+    const float MAX_VOLTAGE = 4100;  // mV単位 - 実用的な満充電レベル
+    
+    if (voltage < MIN_VOLTAGE) return 0;
+    if (voltage > MAX_VOLTAGE) return 100;
+    
+    // 非線形変換（リチウム電池の放電特性に近似）
+    float normalizedVoltage = (voltage - MIN_VOLTAGE) / (MAX_VOLTAGE - MIN_VOLTAGE);
+    
+    // 簡易的な非線形カーブ（3.7V付近での急速な低下を考慮）
+    int percent;
+    if (normalizedVoltage > 0.6) {
+        // 高電圧域（3.78V以上）：比較的リニア
+        percent = (int)(60 + (normalizedVoltage - 0.6) * 100);
+    } else {
+        // 低電圧域（3.78V以下）：急速に低下
+        percent = (int)(normalizedVoltage * normalizedVoltage * 150);
+    }
+    
+    return constrain(percent, 0, 100);
+}
+
+// 非同期バッテリー測定（MIDI処理を妨げない）
+void updateBatteryAsync() {
+    unsigned long currentTime = millis();
+    
+    // 測定タイミングチェック
+    if (currentTime - lastBatteryMeasurement >= BATTERY_MEASUREMENT_INTERVAL) {
+        lastBatteryMeasurement = currentTime;
+        
+        // 1回の測定を実行（delay()なし）
+        float voltage = M5.Power.getBatteryVoltage();
+        batteryVoltageSum += voltage;
+        batteryMeasurementCount++;
+        
+        // 必要な測定回数に達したら平均を計算
+        if (batteryMeasurementCount >= BATTERY_SAMPLES) {
+            float averageVoltage = batteryVoltageSum / batteryMeasurementCount;
+            currentBatteryVoltage = averageVoltage;  // 表示用に保存
+            batteryPercent = calculateBatteryPercent(averageVoltage);
+            
+            // M5.Power.getBatteryLevel()の値も取得
+            m5BatteryLevel = M5.Power.getBatteryLevel();
+            
+            // デバッグ情報出力
+            static unsigned long lastDebugPrint = 0;
+            if (currentTime - lastDebugPrint > 30000) { // 30秒ごと
+                lastDebugPrint = currentTime;
+                Serial.printf("Battery: %.2fV -> %d%% (M5Level: %d)\n", averageVoltage, batteryPercent, m5BatteryLevel);
+            }
+            
+            // 測定値をリセット
+            batteryVoltageSum = 0;
+            batteryMeasurementCount = 0;
+            lastBatteryCheck = currentTime;
+        }
+    }
+}
+
+// バッテリー表示を描画
+void drawBattery() {
+    // 右上にバッテリー残量を表示
+    int batteryX = SCREEN_WIDTH - 25;
+    int batteryY = 2;
+    
+    // 古いバッテリー表示をクリア（拡張エリア）
+    //M5.Display.fillRect(batteryX - 20, batteryY, 45, 36, BLACK);
+    M5.Display.fillRect(batteryX - 28, batteryY, 53, 36, BLACK);
+    
+    // バッテリー残量に応じて色を変更
+    uint16_t batteryColor = GREEN;
+    if (batteryPercent < 20) batteryColor = RED;        // 20%未満で赤
+    else if (batteryPercent < 40) batteryColor = YELLOW; // 40%未満で黄色
+    
+    // 低電圧警告（15%以下で点滅）
+    static bool warningBlink = false;
+    static unsigned long lastBlinkTime = 0;
+    if (batteryPercent < 15 && millis() - lastBlinkTime > 500) {
+        warningBlink = !warningBlink;
+        lastBlinkTime = millis();
+        if (warningBlink) batteryColor = RED;
+        else batteryColor = BLACK; // 点滅効果
+    }
+    
+    // バッテリーアイコンを描画
+    M5.Display.drawRect(batteryX, batteryY, 20, 8, WHITE);
+    M5.Display.fillRect(batteryX + 20, batteryY + 2, 2, 4, WHITE);
+    
+    // バッテリー残量を塗りつぶし
+    int fillWidth = (batteryPercent * 18) / 100;
+    if (fillWidth > 0) {
+        M5.Display.fillRect(batteryX + 1, batteryY + 1, fillWidth, 6, batteryColor);
+    }
+    
+    // パーセンテージを表示
+    M5.Display.setTextSize(1);
+    String percentText = String(batteryPercent) + "%";
+    M5.Display.drawString(percentText, batteryX - 26, batteryY);
+    
+    // 実際の電圧値を表示（デバッグ用）- mV単位を分かりやすく表示
+    // String voltageText = String(currentBatteryVoltage / 1000.0, 2) + "V";
+    // M5.Display.drawString(voltageText, batteryX - 18, batteryY + 12);
+    
+    // M5.Power.getBatteryLevel()の値を表示（デバッグ用）
+    // String m5LevelText = "M5:" + String(m5BatteryLevel);
+    // M5.Display.drawString(m5LevelText, batteryX - 18, batteryY + 24);
+}
+
+// メイン画面の表示を更新
+void updateMainDisplay() {
+    M5.Display.clear();
+    drawBattery();
+    
+    // タイトル
+    M5.Display.drawString("M5EXP-MIDI", 5, 2);
+    
+    // 接続状態（背景色付き）
+    drawConnectionStatus();
+    
+    // 操作説明
+    M5.Display.drawString("BtnB: Calibrate", 5, 65);
+}
+
+// 接続状態を背景色付きで表示
+void drawConnectionStatus() {
+    int statusX = 5;
+    int statusY = 15;
+    int statusWidth = 70;  // 背景の幅
+    int statusHeight = 12; // 背景の高さ
+    
+    if (isConnected) {
+        // Connected時：暗めの水色背景
+        uint16_t darkCyan = M5.Display.color565(0, 90, 220);  // 水色
+        M5.Display.fillRect(statusX - 2, statusY - 1, statusWidth, statusHeight, darkCyan);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.drawString("Connected", statusX, statusY);
+    } else {
+        // Waiting時：黒背景
+        M5.Display.fillRect(statusX - 2, statusY - 1, statusWidth, statusHeight, BLACK);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.drawString("Waiting...", statusX, statusY);
+    }
+    
+    // テキスト色を白に戻す（他の表示への影響を防ぐ）
+    M5.Display.setTextColor(WHITE);
+}
+
 void setup() {
   // M5StickC初期化
   auto cfg = M5.config();
@@ -137,9 +321,14 @@ void setup() {
   
   M5.Display.setRotation(1);
   M5.Display.setTextSize(1);
-  M5.Display.clear();
-  M5.Display.drawString("M5EXP-MIDI (NimBLE)", 5, 10);
-  M5.Display.drawString("Initializing...", 10, 30);
+  
+  // 液晶明度設定（節電のため）
+  M5.Display.setBrightness(LCD_BRIGHTNESS);
+  Serial.printf("LCD Brightness set to: %d (0-255)\n", LCD_BRIGHTNESS);
+  
+  // 初期画面表示
+  updateMainDisplay();
+  M5.Display.drawString("Initializing...", 5, 28);
   
   Serial.begin(115200);
   
@@ -159,9 +348,7 @@ void setup() {
     displayNeedsUpdate = true;  // 画面更新フラグ
     Serial.println("BLE-MIDI Connected (NimBLE)");
     if (!calibrator.isCalibrating()) {
-      M5.Display.clear();
-      M5.Display.drawString("M5EXP-MIDI (NimBLE)", 5, 10);
-      M5.Display.drawString("Connected!", 10, 30);
+      updateMainDisplay();
     }
   });
   
@@ -172,9 +359,7 @@ void setup() {
     Serial.println("Waiting for reconnection...");
     
     if (!calibrator.isCalibrating()) {
-      M5.Display.clear();
-      M5.Display.drawString("M5EXP-MIDI (NimBLE)", 5, 10);
-      M5.Display.drawString("Disconnected", 10, 30);
+      updateMainDisplay();
     }
     
     // 注意：MIDI.begin()を再実行しない
@@ -185,25 +370,43 @@ void setup() {
   MIDI.begin();
   
   Serial.println("BLE-MIDI Controller Ready (NimBLE backend)");
-  M5.Display.drawString("Ready (NimBLE)", 10, 45);
-  M5.Display.drawString("BtnB: Calibrate", 10, 60);
+  
+  // 初期化完了表示
+  delay(1000);
+  updateMainDisplay();
+  
+  // 起動時にバッテリー測定開始
+  batteryInitialized = true;
+  // 起動時は即座に1回測定
+  currentBatteryVoltage = M5.Power.getBatteryVoltage();
+  m5BatteryLevel = M5.Power.getBatteryLevel();
+  batteryPercent = calculateBatteryPercent(currentBatteryVoltage);
+  drawBattery();
 }
 
 void loop() {
   M5.update();
   
-  // 定期的な接続状態チェック
+  // バッテリー測定（非同期・MIDI処理を妨げない）
+  updateBatteryAsync();
+  
+  // 定期的なバッテリー表示更新（測定完了後または1分経過後）
   unsigned long currentTime = millis();
+  if (batteryMeasurementCount == 0 && (currentTime - lastBatteryCheck > BATTERY_CHECK_INTERVAL)) {
+    // 1分経過したが測定が完了していない場合、測定を開始
+    lastBatteryMeasurement = 0; // 次回のupdateBatteryAsync()で即座に測定開始
+  }
+  
+  // バッテリー値が更新された場合、表示を更新
+  static int lastDisplayedBattery = -1;
+  if (batteryPercent != lastDisplayedBattery) {
+    drawBattery();
+    lastDisplayedBattery = batteryPercent;
+  }
+  
+  // 定期的な接続状態チェック
   if (currentTime - lastConnectionCheck > CONNECTION_CHECK_INTERVAL) {
     lastConnectionCheck = currentTime;
-    
-    // BLE接続状態を強制チェック（デバッグ用）
-    // 実際の接続状態とisConnectedが一致しない場合の対策
-    static int disconnectCounter = 0;
-    if (isConnected) {
-      // 接続中だが実際には切断されている可能性をチェック
-      // 何らかの方法で実際の接続状態を確認したい場合はここに実装
-    }
   }
   
   // アナログ値読み取り (0-4095)
@@ -233,11 +436,23 @@ void loop() {
       Serial.printf("Analog: %d, MIDI: %d (not connected)\n", analogValue, midiValue);
     }
     
-    // ディスプレイ更新（元の方式：常時更新で確実な表示）
-    M5.Display.fillRect(0, 70, 160, 40, BLACK);
-    M5.Display.drawString("Status: " + String(isConnected ? "Connected" : "Waiting"), 5, 70);
-    M5.Display.drawString("Analog: " + String(analogValue), 10, 85);
-    M5.Display.drawString("MIDI: " + String(midiValue), 10, 100);
+    // 値の表示エリアをクリア（バッテリー表示は保持）
+    M5.Display.fillRect(0, 28, SCREEN_WIDTH-30, 35, BLACK);
+    
+    // アナログ値とMIDI値を表示（コンパクトに）
+    M5.Display.drawString("ADC: " + String(analogValue), 5, 28);
+    M5.Display.drawString("CC" + String(CC_NUMBER) + ": " + String(midiValue), 5, 40);
+    
+    // MIDI値のバーグラフ表示
+    int barWidth = (midiValue * 100) / 127;  // 0-100の範囲
+    M5.Display.drawRect(5, 52, 102, 8, WHITE);
+    if (barWidth > 0) {
+      M5.Display.fillRect(6, 53, barWidth, 6, GREEN);
+    }
+    // バーの余白をクリア
+    if (barWidth < 100) {
+      M5.Display.fillRect(6 + barWidth, 53, 100 - barWidth, 6, BLACK);
+    }
     
     lastValue = midiValue;
   }
